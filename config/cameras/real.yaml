@@ -1,0 +1,10 @@
+cameras:
+  - name: d435_1
+    source: {type: realsense, serial: "", width: 1280, height: 720, fps: 30, exposure_us: 4000, gain: 64}
+    intrinsics: device
+    extrinsics: ../../calib/extrinsics_real_d435_1.yaml
+
+  - name: d435_2
+    source: {type: realsense, serial: "", width: 1280, height: 720, fps: 30, exposure_us: 4000, gain: 64}
+    intrinsics: device
+    extrinsics: ../../calib/extrinsics_real_d435_2.yaml

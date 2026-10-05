@@ -1,0 +1,10 @@
+publish:
+  enabled: true
+  host: 127.0.0.1
+  port: 7310
+
+ground_truth:
+  enabled: true
+  bind_host: 0.0.0.0
+  port: 7200
+  max_dt_ms: 30

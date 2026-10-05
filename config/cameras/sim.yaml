@@ -1,0 +1,12 @@
+cameras:
+  - name: perception_cam_1
+    source: {type: shm, name: /perception_cam_1}
+    intrinsics: ../intrinsics/sim_1280x720_fovy42.yaml
+    extrinsics: ../../calib/extrinsics_sim_perception_cam_1.yaml
+    nominal: {pos: [1.10, -0.35, 1.20], look_at: [0.70, 0.0, 0.76]}
+
+  - name: perception_cam_2
+    source: {type: shm, name: /perception_cam_2}
+    intrinsics: ../intrinsics/sim_1280x720_fovy42.yaml
+    extrinsics: ../../calib/extrinsics_sim_perception_cam_2.yaml
+    nominal: {pos: [1.10, 0.35, 1.20], look_at: [0.70, 0.0, 0.76]}

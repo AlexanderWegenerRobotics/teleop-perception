@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teleop-perception"
+version = "0.1.0"
+description = "Fiducial-based object pose estimation for the teleop twin, in sim and on hardware"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python>=4.7",
+    "scipy",
+    "pyyaml",
+    "msgpack",
+    "trimesh",
+    "manifold3d",
+]
+
+[project.optional-dependencies]
+sim = ["mujoco>=3.3"]
+real = ["pyrealsense2"]
+
+[tool.setuptools]
+packages = ["teleop_perception"]
