@@ -33,6 +33,9 @@ def main():
     k.add_argument("--role", choices=["perception", "operator"], default="perception",
                    help="which cameras: the pose-estimation cameras or the operator (VR video) camera")
 
+    t = sub.add_parser("target-check", help="live count of calibration-target corners and marker size per camera")
+    t.add_argument("--role", choices=["perception", "operator"], default="perception")
+
     e = sub.add_parser("evaluate", help="error summary of a logged run")
     e.add_argument("run_dir")
 
@@ -54,6 +57,9 @@ def main():
             os.environ["MUJOCO_GL"] = "egl"
         from .simcheck import run
         run(cfg, a.scenes, a.jitter, a.seed, a.tag_shift_mm, a.noise, a.blur, a.save)
+    elif a.cmd == "target-check":
+        from .targetcheck import run as check
+        check(cfg, a.role)
     elif a.cmd == "calibrate":
         from .calibrate import calibrate
         calibrate(cfg, a.samples, a.role)

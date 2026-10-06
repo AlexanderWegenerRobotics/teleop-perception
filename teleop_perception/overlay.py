@@ -16,11 +16,43 @@ def overlay_view(T_world_cam, K, size):
             "capture_fov": round(hfov, 4)}
 
 
-def overlay_K(view, size):
-    """Pinhole matrix the overlay renders with: square pixels, centred principal point."""
+def pinhole_out(K, dist, size, samples=64):
+    """Square-pixel, centred pinhole for the undistorted video, zoomed just enough to leave no empty border."""
     w, h = size
-    f = (w / 2.0) / np.tan(np.radians(view["capture_fov"]) / 2.0)
-    return np.array([[f, 0.0, (w - 1) / 2.0], [0.0, f, (h - 1) / 2.0], [0.0, 0.0, 1.0]])
+    u = np.r_[np.linspace(0, w - 1, samples), np.full(samples, w - 1), np.linspace(0, w - 1, samples), np.zeros(samples)]
+    v = np.r_[np.zeros(samples), np.linspace(0, h - 1, samples), np.full(samples, h - 1), np.linspace(0, h - 1, samples)]
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+
+    def inside(f):
+        """True if every border pixel of the output samples a pixel inside the raw image."""
+        P = np.c_[(u - cx) / f, (v - cy) / f, np.ones(len(u))]
+        uv, _ = cv2.projectPoints(P, np.zeros(3), np.zeros(3), K, dist)
+        uv = uv.reshape(-1, 2)
+        return bool(np.all((uv[:, 0] >= 0) & (uv[:, 0] <= w - 1) & (uv[:, 1] >= 0) & (uv[:, 1] <= h - 1)))
+
+    lo, hi = 0.5 * K[0, 0], 3.0 * K[0, 0]
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (lo, mid) if inside(mid) else (mid, hi)
+    return np.array([[hi, 0.0, cx], [0.0, hi, cy], [0.0, 0.0, 1.0]])
+
+
+def write_undistort(path, K, dist, K_out, size, camera, stamp):
+    """Undistortion file the avatar streamer reads: the calibrated camera and the pinhole to resample into."""
+    import yaml
+    w, h = int(size[0]), int(size[1])
+    cam = {"width": w, "height": h, "fx": float(K[0, 0]), "fy": float(K[1, 1]), "cx": float(K[0, 2]),
+           "cy": float(K[1, 2]), "dist": [float(v) for v in np.ravel(dist)[:5]]}
+    out = {"width": w, "height": h, "fx": float(K_out[0, 0]), "fy": float(K_out[1, 1]), "cx": float(K_out[0, 2]),
+           "cy": float(K_out[1, 2])}
+    with open(path, "w") as f:
+        yaml.safe_dump({"camera_name": camera, "date": stamp, "camera": cam, "output": out}, f, sort_keys=False)
+    return path
+
+
+def undistorted_pixels(uv, K, dist, K_out):
+    """Where raw pixels land in the undistorted video."""
+    return cv2.undistortPoints(np.asarray(uv, dtype=np.float64).reshape(-1, 1, 2), K, dist, None, K_out).reshape(-1, 2)
 
 
 def project(T_world_cam, K, dist, P):

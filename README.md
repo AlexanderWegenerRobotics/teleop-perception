@@ -32,6 +32,7 @@ python -m teleop_perception generate     # tagged models, tagged task, perceptio
 python -m teleop_perception simcheck     # offline render in MuJoCo, error vs ground truth (--tag-shift-mm, --noise, --blur)
 python -m teleop_perception calibrate    # arm moves the target through poses, writes calib/extrinsics_*, calib/intrinsics_* (ChArUco) and calib/reference_*
 python -m teleop_perception calibrate --role operator   # same for the operator camera, plus the VR overlay viewpoint
+python -m teleop_perception target-check --role operator   # live corner count and marker size per camera, to place cameras and size the board
 python -m teleop_perception run          # live estimation, publish, log (--show for overlays)
 python -m teleop_perception evaluate logs/<run>
 ```
@@ -53,13 +54,18 @@ With the board, `calibrate` runs in two stages. First random poses around the st
 
 ## Operator camera (VR ghost overlay)
 
-Cameras with `role: operator` in the camera file are not used for pose estimation. `calibrate --role operator` calibrates them in a separate run with the same board, using the `operator` overrides in `calibration.yaml` (start position, yaw search, coverage distances and box) since that camera sits elsewhere. Besides extrinsics and intrinsics it writes `calib/overlay_<mode>_<camera>.json` (static viewpoint pos/look_at/up, horizontal FOV, render size) and updates `operator.overlay_file` in the VR interface in place when that path exists; on a remote setup copy the overlay file over. The overlay is an ideal pinhole, so on hardware the video has to be undistorted to it.
+Cameras with `role: operator` in the camera file are not used for pose estimation. `calibrate --role operator` calibrates them in a separate run with the same board, using the `operator` overrides in `calibration.yaml` (start position, yaw search, coverage distances and box) since that camera sits elsewhere. It writes, next to the extrinsics and intrinsics:
 
-In sim the report also prints the pixel error over the workspace: calibrated camera vs truth, overlay vs undistorted video, and overlay vs raw video.
+- `calib/undistort_<mode>_<camera>.yaml`: the calibrated camera and the pinhole the avatar streamer resamples the video into (square pixels, centred principal point, zoomed so no black border is left).
+- `calib/overlay_<mode>_<camera>.json`: static viewpoint pos/look_at/up and the horizontal FOV of that pinhole. It also updates `operator.overlay_file` in the VR interface when that path exists; on a remote setup copy the file over.
+
+The avatar streamer (teleop-simulator `avatar_pipeline`) takes two keys per camera entry: `undistort: <path to calib/undistort_*.yaml>` resamples every frame before streaming and logging, and `raw_shm: /operator_cam_raw` publishes the raw frames to shared memory, which is where `calibrate` reads the real camera from (the RealSense can only be opened by one process). A missing or mismatched undistortion file is reported and the raw video is streamed.
+
+In sim the operator camera gets a simulated lens: `generate` puts the camera's `dist` into its `stream_cameras` entry, so the avatar writes distorted frames to shared memory, and points the streamer's `undistort` at the calibration output. Sim and hardware then run the same chain: lens, calibration from raw frames, undistortion in the streamer, overlay from the same pinhole. The report prints the pixel error over the workspace of the calibrated camera, of the ghost against the undistorted video, and of the ghost against the video without undistortion.
 
 ## Sim ground truth for intrinsics
 
-An intrinsics file may combine `fovy_deg` with `dist`. With `apply_distortion: true` on a shared-memory source the reader warps every sim frame with that distortion, so the sim behaves like a real lens with known parameters and the calibration report compares against them (`desk_cam` uses k1 0.06, k2 -0.03). Inject only k1/k2 when `dist_terms` is 2.
+An intrinsics file may combine `fovy_deg` with `dist`; for operator cameras that distortion is rendered by the avatar (above). `apply_distortion: true` on a shared-memory source instead warps frames in the reader, for cameras without a simulated lens. Inject only k1/k2 when `dist_terms` is 2.
 
 ## Output
 

@@ -57,12 +57,12 @@ def _fmt(vals):
     return " ".join(f"{v:.6g}" for v in vals)
 
 
-def add_slab(asset, body, name, png, hw, hh, T):
+def add_slab(asset, body, name, png, hw, hh, T, emission=0.0):
     """Adds texture, material, mesh and a visual-only geom showing png on a slab at pose T."""
     verts, uvs, faces = _slab(hw, hh)
     ET.SubElement(asset, "texture", name=f"{name}_tex", type="2d", file=png)
     ET.SubElement(asset, "material", name=f"{name}_mat", texture=f"{name}_tex", rgba="1 1 1 1", specular="0",
-                  shininess="0", reflectance="0")
+                  shininess="0", reflectance="0", emission=_fmt([emission]))
     ET.SubElement(asset, "mesh", name=f"{name}_mesh", vertex=_fmt(np.ravel(verts)), texcoord=_fmt(np.ravel(uvs)),
                   face=" ".join(str(i) for i in np.ravel(faces)))
     ET.SubElement(body, "geom", name=name, type="mesh", mesh=f"{name}_mesh", material=f"{name}_mat",
@@ -81,13 +81,14 @@ def add_tag(asset, body, tag, dictionary, prefix, tex_dir):
     add_slab(asset, body, f"{prefix}tag_{tag.id}", png, half, half, tag.T)
 
 
-def add_charuco(asset, body, target, T, prefix, tex_dir):
+def add_charuco(asset, body, target, T, prefix, tex_dir, emission=0.0):
     """Adds the ChArUco board with its margin as a textured slab."""
     png = "charuco_board.png"
     img = target.image()
     cv2.imwrite(os.path.join(tex_dir, png), img)
     m_per_px = target.square / PX_PER_SQUARE
-    add_slab(asset, body, f"{prefix}charuco", png, img.shape[1] * m_per_px / 2.0, img.shape[0] * m_per_px / 2.0, T)
+    add_slab(asset, body, f"{prefix}charuco", png, img.shape[1] * m_per_px / 2.0, img.shape[0] * m_per_px / 2.0, T,
+             emission)
 
 
 def write_print(target, path, dpi=600):
@@ -212,7 +213,8 @@ def _hand(cfg, hand_src, out_dir, written):
     dst = os.path.join(out_dir, "hand_tagged.xml")
     if target.kind == "charuco":
         written.append(write_print(target, os.path.join(print_dir, "charuco_board_print.pdf")))
-        extra = lambda asset, b, tex_dir: add_charuco(asset, b, target, T, "calib_", tex_dir)
+        glow = float(cfg.calibration["charuco"].get("sim_emission", 0.0))
+        extra = lambda asset, b, tex_dir: add_charuco(asset, b, target, T, "calib_", tex_dir, glow)
         path = tag_model(hand_src, dst, body, [], cfg.board.dictionary, "calib_", mount_stl, extra)
     else:
         tag = Tag(id=target.id, size=target.size, T=T)
@@ -256,17 +258,51 @@ def _perception_cameras(cfg):
     return cams, streams
 
 
+def _operator_streams(cfg, pc, rel):
+    """Simulated lens on each operator camera's shm stream, and the streamer undistorting it with the calibration."""
+    for c in cfg.operator_cameras:
+        if c.source.get("type") != "shm":
+            continue
+        shm = c.source["name"]
+        d = [float(v) for v in np.ravel((c.intrinsics_base or c.intrinsics).dist)]
+        while d and d[-1] == 0.0:
+            d.pop()
+        for s in pc.get("stream_cameras", []):
+            if s.get("shm_name") == shm:
+                if d:
+                    s["distortion"] = d
+                else:
+                    s.pop("distortion", None)
+        und = os.path.join(os.path.dirname(c.extrinsics_path), f"undistort_{cfg.mode}_{c.name}.yaml")
+        for cam in pc.get("cameras", []):
+            if cam.get("shm_name") == shm:
+                cam["undistort"] = rel(und)
+
+
+def _load_out(root, base, out):
+    """Existing generated config (keeps hand edits) or a fresh copy of the base; returns (config, is_new)."""
+    path = os.path.join(root, out)
+    src = path if os.path.exists(path) else os.path.join(root, base)
+    with open(src) as f:
+        return yaml.safe_load(f), src != path
+
+
 def sim_configs(cfg, run_dir, tagged_task, ref_path, hand_path):
-    """Writes perception variants of the simulator's sim, pipeline and robot configs."""
+    """Writes perception variants of the simulator's sim, pipeline and robot configs.
+
+    The first run copies the base configs; later runs only update the entries perception owns (tagged hand,
+    reference tags, perception cameras and streams, operator lens), so hand edits such as rendering or the task
+    survive."""
     sim = cfg.sim
     root = sim["root"]
     rel = lambda p: os.path.relpath(p, run_dir).replace(os.sep, "/")
     cams, streams = _perception_cameras(cfg)
     names = {c["name"] for c in cams}
     out = []
-    with open(os.path.join(root, sim["base_sim_config"])) as f:
-        sc = yaml.safe_load(f)
-    sc["simulation"]["task_config"] = rel(tagged_task)
+    sc, new = _load_out(root, sim["base_sim_config"], sim["out_sim_config"])
+    if new:
+        sc["simulation"]["task_config"] = rel(tagged_task)
+        sc.setdefault("rendering", {})["enabled"] = True
     if hand_path:
         for d in sc.get("devices", []):
             if d.get("name") == sim.get("gripper_device", "hand_left"):
@@ -278,15 +314,14 @@ def sim_configs(cfg, run_dir, tagged_task, ref_path, hand_path):
     path = os.path.join(root, sim["out_sim_config"])
     _dump(sc, path)
     out.append(path)
-    with open(os.path.join(root, sim["base_pipeline_config"])) as f:
-        pc = yaml.safe_load(f)
+    pc, _ = _load_out(root, sim["base_pipeline_config"], sim["out_pipeline_config"])
     pc["stream_cameras"] = [s for s in pc.get("stream_cameras", []) if s.get("camera") not in names] + streams
+    _operator_streams(cfg, pc, rel)
     path = os.path.join(root, sim["out_pipeline_config"])
     _dump(pc, path)
     out.append(path)
     if sim.get("base_robot_config") and sim.get("out_robot_config"):
-        with open(os.path.join(root, sim["base_robot_config"])) as f:
-            rc = yaml.safe_load(f)
+        rc, _ = _load_out(root, sim["base_robot_config"], sim["out_robot_config"])
         gt = cfg.network.get("ground_truth", {})
         rc.setdefault("avatar", {})["scene_objects"] = {"enabled": True, "host": "127.0.0.1",
                                                         "port": int(gt.get("port", 7200))}

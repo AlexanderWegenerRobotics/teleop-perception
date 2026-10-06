@@ -90,3 +90,14 @@ class Arm:
                 return None
         e = _err(fk_frames(q)[1], self.T_base_inv @ T_goal)
         return q if np.linalg.norm(e[:3]) < tol[0] and np.linalg.norm(e[3:]) < tol[1] else None
+
+    def clearance(self, q, point, samples=5):
+        """Smallest distance (m) from the links, sampled between joint origins, to a world point."""
+        frames, T = fk_frames(q)
+        pts = [np.zeros(3)] + [F[:3, 3] for F in frames] + [T[:3, 3]]
+        p = (self.T_base_inv @ np.r_[np.asarray(point, dtype=float), 1.0])[:3]
+        best = np.inf
+        for a, b in zip(pts[:-1], pts[1:]):
+            for s in np.linspace(0.0, 1.0, samples):
+                best = min(best, float(np.linalg.norm(a + s * (b - a) - p)))
+        return best

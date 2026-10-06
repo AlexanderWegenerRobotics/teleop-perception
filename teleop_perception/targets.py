@@ -46,7 +46,13 @@ class CharucoTarget:
         self.margin = float(spec.get("margin", self.square / 2.0))
         ids = np.arange(int(spec.get("first_id", 0)), int(spec.get("first_id", 0)) + (nx * ny) // 2)
         self.board = cv2.aruco.CharucoBoard((nx, ny), self.square, self.marker, d, ids)
-        self.detector = cv2.aruco.CharucoDetector(self.board)
+        p = cv2.aruco.DetectorParameters()
+        p.minMarkerPerimeterRate = 0.01
+        p.perspectiveRemovePixelPerCell = 8
+        p.perspectiveRemoveIgnoredMarginPerCell = 0.25
+        p.adaptiveThreshWinSizeMin, p.adaptiveThreshWinSizeMax, p.adaptiveThreshWinSizeStep = 3, 33, 4
+        p.polygonalApproxAccuracyRate = 0.05
+        self.detector = cv2.aruco.CharucoDetector(self.board, cv2.aruco.CharucoParameters(), p)
         self.min_points = int(spec.get("min_corners", 6))
         self.size_xy = (nx * self.square, ny * self.square)
         self.extent = (self.size_xy[0] + 2 * self.margin, self.size_xy[1] + 2 * self.margin)

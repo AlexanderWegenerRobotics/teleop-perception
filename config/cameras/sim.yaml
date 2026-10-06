@@ -15,8 +15,8 @@ cameras:
 
   - name: desk_cam
     role: operator
-    source: {type: shm, name: avatar_cam, apply_distortion: true}
+    source: {type: shm, name: avatar_cam}
     intrinsics: ../intrinsics/sim_1280x960_fovy60_dist.yaml
     extrinsics: ../../calib/extrinsics_sim_desk_cam.yaml
     intrinsics_calibrated: ../../calib/intrinsics_sim_desk_cam.yaml
-    nominal: {pos: [0.0, -0.45, 1.5], look_at: [0.7, 0.05, 0.72]}
+    nominal: {pos: [0.1, -0.4, 1.35], look_at: [0.65, 0.0, 0.78]}

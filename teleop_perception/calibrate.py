@@ -11,7 +11,8 @@ from . import wire
 from .config import Intrinsics, calib_dir
 from .detection import TagDetector
 from .geometry import T_from_rvec, make_T, pose_error, to_list
-from .overlay import overlay_K, overlay_view, pixel_error, project, workspace_points, write_overlay
+from .overlay import (overlay_view, pinhole_out, pixel_error, project, undistorted_pixels, workspace_points,
+                      write_overlay, write_undistort)
 from .kinematics import Arm
 from .planner import candidates, motion_cost, order_poses
 from .reference import workspace_drift
@@ -235,15 +236,17 @@ def _print_map(name, hits, need):
         print(f"          {row}")
 
 
-def _next_pose(arm, model, todo, open_):
-    """Cheapest (index, option) among the open cells whose move stays off the joint limits, or None."""
+def _next_pose(arm, model, todo, open_, cam_pos=None, clearance=0.0):
+    """Cheapest (index, option) among the open cells whose move stays off the joint limits and away from the camera."""
     cur = arm.latest()[1]
     q = None if model is None else _q(arm)
     best, best_cost = None, np.inf
     for k in open_:
         for o, P in enumerate(todo[k][1]):
-            if model is not None and model.follow(q, P) is None:
-                continue
+            if model is not None:
+                q_end = model.follow(q, P)
+                if q_end is None or (cam_pos is not None and model.clearance(q_end, cam_pos) < clearance):
+                    continue
             cost = motion_cost(cur, P)
             if cost < best_cost:
                 best, best_cost = (k, o), cost
@@ -278,7 +281,8 @@ def _cover(arm, cfg, cams, sources, target, samples, T0, st, cap, model=None):
                 open_ = [k for k, (c, opts) in enumerate(todo) if hits[c[1], c[0]] < need and opts]
                 if not open_:
                     break
-                pick = _next_pose(arm, model, todo, open_)
+                pick = _next_pose(arm, model, todo, open_, r["T_world_cam"][:3, 3],
+                                  float(cov.get("camera_clearance_m", 0.0)))
                 if pick is None:
                     if recovered or not _feasible(model, arm, T0):
                         print(f"[calib] {name} distance {dist_i + 1}/{n_d}: no remaining cell reachable within the "
@@ -433,11 +437,15 @@ def _save_reference(path, ref, stamp, mode):
 
 
 def _report_overlay(cfg, name, cam, r, size, stamp, base):
-    """Writes the VR overlay viewpoint of an operator camera and, in sim, its pixel error against the truth."""
+    """Writes the undistortion file and VR overlay viewpoint of an operator camera; in sim, prints the overlay error."""
     c = cfg.calibration
-    view = overlay_view(r["T_world_cam"], r["K"], size)
+    K_out = pinhole_out(r["K"], r["dist"], size)
+    und = os.path.join(calib_dir(cfg), f"undistort_{cfg.mode}_{name}.yaml")
+    write_undistort(und, r["K"], r["dist"], K_out, size, name, stamp)
+    view = overlay_view(r["T_world_cam"], K_out, size)
     out = os.path.join(calib_dir(cfg), f"overlay_{cfg.mode}_{name}.json")
     write_overlay(out, view, size, name, stamp)
+    print(f"[calib] {name}: streamer undistortion -> {und} (pinhole f {K_out[0, 0]:.1f} px, raw fx {r['K'][0, 0]:.1f})")
     print(f"[calib] {name}: overlay pos {view['pos']} look_at {view['look_at']} up {view['up']} "
           f"hfov {view['capture_fov']:.2f} deg -> {out}")
     vr = c.get("overlay_file")
@@ -448,21 +456,17 @@ def _report_overlay(cfg, name, cam, r, size, stamp, base):
             print(f"[calib] {name}: updated {vr}")
         else:
             print(f"[calib] {name}: overlay_file {vr} not found, copy {out} over by hand")
-    if abs(r["K"][0, 2] - (size[0] - 1) / 2.0) > 2.0 or abs(r["K"][1, 2] - (size[1] - 1) / 2.0) > 2.0 \
-            or np.max(np.abs(r["dist"])) > 1e-3:
-        print(f"[calib] {name}: principal point / distortion are not what the overlay assumes -- the video must be "
-              f"undistorted to the overlay pinhole")
     if cam.nominal is None or base is None:
         return
     ws = c.get("coverage", {})
     P = workspace_points(ws.get("workspace_min", [0.3, -0.4, 0.7]), ws.get("workspace_max", [0.9, 0.4, 1.1]))
-    truth = project(cam.nominal, base.K, base.dist, P)
-    ideal = project(cam.nominal, base.K, None, P)
-    calib = project(r["T_world_cam"], r["K"], r["dist"], P)
-    ov = project(r["T_world_cam"], overlay_K(view, size), None, P)
-    for label, a, b in (("calibrated camera vs truth", calib, truth),
-                        ("overlay vs undistorted video", ov, ideal),
-                        ("overlay vs raw video (no undistortion)", ov, truth)):
+    raw_true = project(cam.nominal, base.K, base.dist, P)
+    raw_cal = project(r["T_world_cam"], r["K"], r["dist"], P)
+    video = undistorted_pixels(raw_true, r["K"], r["dist"], K_out)
+    ghost = project(r["T_world_cam"], K_out, None, P)
+    for label, a, b in (("calibrated camera vs truth (raw image)", raw_cal, raw_true),
+                        ("ghost vs undistorted video", ghost, video),
+                        ("ghost vs video without undistortion", ghost, raw_true)):
         e = pixel_error(a, b, size)
         if e:
             print(f"[calib] {name}: {label}: {e[0]:.2f} px mean, {e[1]:.2f} px max over the workspace")

@@ -10,3 +10,10 @@ cameras:
     intrinsics: device
     extrinsics: ../../calib/extrinsics_real_d435_2.yaml
     intrinsics_calibrated: ../../calib/intrinsics_real_d435_2.yaml
+
+  - name: operator_cam
+    role: operator
+    source: {type: shm, name: /operator_cam_raw}
+    intrinsics: ../intrinsics/d435i_color_1280x720_nominal.yaml
+    extrinsics: ../../calib/extrinsics_real_operator_cam.yaml
+    intrinsics_calibrated: ../../calib/intrinsics_real_operator_cam.yaml

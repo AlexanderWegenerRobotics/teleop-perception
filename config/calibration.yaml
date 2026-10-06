@@ -23,6 +23,7 @@ charuco:
   min_corners: 6
   plate_thickness: 0.004
   plate_offset_z: 0.035
+  sim_emission: 0.5
 
 intrinsics:
   estimate: true
@@ -48,7 +49,7 @@ motion:
   pos_range_m: [0.10, 0.10, 0.03]
   rot_range_deg: 25.0
   lin_speed: 0.05
-  rot_speed_deg: 15.0
+  rot_speed_deg: 8.0
   workspace_min: [0.62, -0.18, 0.86]
   workspace_max: [0.85, 0.18, 0.92]
 
@@ -78,7 +79,8 @@ operator:
     workspace_min: [0.45, -0.30, 0.86]
     workspace_max: [0.80, 0.15, 1.05]
   coverage:
-    distances_m: [0.7, 0.9]
+    distances_m: [0.6, 0.75]
+    camera_clearance_m: 0.30
     workspace_min: [0.30, -0.40, 0.78]
     workspace_max: [0.85, 0.30, 1.20]
 
