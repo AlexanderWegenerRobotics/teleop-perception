@@ -6,8 +6,9 @@ import cv2
 import numpy as np
 import yaml
 
-from .config import Tag, _tag
+from .config import Tag
 from .geometry import quat_from_R
+from .targets import PX_PER_SQUARE, make_target
 
 QUIET_CELLS = 1
 PX_PER_CELL = 32
@@ -31,9 +32,9 @@ def tag_image(dictionary, tag_id):
     return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
 
-def _slab(half):
-    """Vertices, texcoords and outward faces of a thin square slab whose top face is z = 0."""
-    top = [(-half, half), (half, half), (half, -half), (-half, -half)]
+def _slab(hw, hh):
+    """Vertices, texcoords and outward faces of a thin rectangular slab whose top face is z = 0."""
+    top = [(-hw, hh), (hw, hh), (hw, -hh), (-hw, -hh)]
     verts = [(x, y, 0.0) for x, y in top] + [(x, y, -SLAB_DEPTH) for x, y in top]
     uv_top = [(0.0, V_TOP), (1.0, V_TOP), (1.0, 1.0 - V_TOP), (0.0, 1.0 - V_TOP)]
     uvs = uv_top + uv_top
@@ -56,26 +57,46 @@ def _fmt(vals):
     return " ".join(f"{v:.6g}" for v in vals)
 
 
+def add_slab(asset, body, name, png, hw, hh, T):
+    """Adds texture, material, mesh and a visual-only geom showing png on a slab at pose T."""
+    verts, uvs, faces = _slab(hw, hh)
+    ET.SubElement(asset, "texture", name=f"{name}_tex", type="2d", file=png)
+    ET.SubElement(asset, "material", name=f"{name}_mat", texture=f"{name}_tex", rgba="1 1 1 1", specular="0",
+                  shininess="0", reflectance="0")
+    ET.SubElement(asset, "mesh", name=f"{name}_mesh", vertex=_fmt(np.ravel(verts)), texcoord=_fmt(np.ravel(uvs)),
+                  face=" ".join(str(i) for i in np.ravel(faces)))
+    ET.SubElement(body, "geom", name=name, type="mesh", mesh=f"{name}_mesh", material=f"{name}_mat",
+                  pos=_fmt(T[:3, 3]), quat=_fmt(quat_from_R(T[:3, :3])),
+                  contype="0", conaffinity="0", group="2", density="0")
+
+
 def add_tag(asset, body, tag, dictionary, prefix, tex_dir):
-    """Adds texture, material, mesh and a visual-only geom for one tag."""
+    """Adds one tag with its quiet zone as a textured slab."""
     cells = marker_cells(dictionary)
     half = tag.size / 2.0 * (cells + 2 * QUIET_CELLS) / cells
     png = f"tag_{tag.id}.png"
     path = os.path.join(tex_dir, png)
     if not os.path.exists(path):
         cv2.imwrite(path, cv2.cvtColor(tag_image(dictionary, tag.id), cv2.COLOR_RGB2BGR))
-    verts, uvs, faces = _slab(half)
-    tex = f"{prefix}tagtex_{tag.id}"
-    mat = f"{prefix}tagmat_{tag.id}"
-    mesh = f"{prefix}tagmesh_{tag.id}"
-    ET.SubElement(asset, "texture", name=tex, type="2d", file=png)
-    ET.SubElement(asset, "material", name=mat, texture=tex, rgba="1 1 1 1", specular="0", shininess="0",
-                  reflectance="0")
-    ET.SubElement(asset, "mesh", name=mesh, vertex=_fmt(np.ravel(verts)), texcoord=_fmt(np.ravel(uvs)),
-                  face=" ".join(str(i) for i in np.ravel(faces)))
-    ET.SubElement(body, "geom", name=f"{prefix}tag_{tag.id}", type="mesh", mesh=mesh, material=mat,
-                  pos=_fmt(tag.T[:3, 3]), quat=_fmt(quat_from_R(tag.T[:3, :3])),
-                  contype="0", conaffinity="0", group="2", density="0")
+    add_slab(asset, body, f"{prefix}tag_{tag.id}", png, half, half, tag.T)
+
+
+def add_charuco(asset, body, target, T, prefix, tex_dir):
+    """Adds the ChArUco board with its margin as a textured slab."""
+    png = "charuco_board.png"
+    img = target.image()
+    cv2.imwrite(os.path.join(tex_dir, png), img)
+    m_per_px = target.square / PX_PER_SQUARE
+    add_slab(asset, body, f"{prefix}charuco", png, img.shape[1] * m_per_px / 2.0, img.shape[0] * m_per_px / 2.0, T)
+
+
+def write_print(target, path, dpi=600):
+    """Writes the target at true size as a PDF for printing at 100 %."""
+    from PIL import Image
+    px = int(round(target.square / 0.0254 * dpi))
+    img = target.image(px)
+    Image.fromarray(img).save(path, resolution=float(dpi))
+    return path
 
 
 def _find_body(root, name):
@@ -86,8 +107,8 @@ def _find_body(root, name):
     raise KeyError(f"body '{name}' not found")
 
 
-def tag_model(src, dst, body_name, tags, dictionary, prefix, mount_stl=None):
-    """Copies an MJCF model and puts tags (and optionally a printed tag mount) on one of its bodies."""
+def tag_model(src, dst, body_name, tags, dictionary, prefix, mount_stl=None, extra=None):
+    """Copies an MJCF model and puts tags, an optional printed mount and optional extra geoms on one body."""
     with open(src, "r", encoding="utf-8") as f:
         text = re.sub(r"<!--.*?-->", "", f.read(), flags=re.DOTALL)
     root = ET.fromstring(text)
@@ -114,6 +135,8 @@ def tag_model(src, dst, body_name, tags, dictionary, prefix, mount_stl=None):
     body = _find_body(root, body_name)
     for tag in tags:
         add_tag(asset, body, tag, dictionary, prefix, tex_dir)
+    if extra is not None:
+        extra(asset, body, tex_dir)
     if mount_stl:
         rel = os.path.relpath(os.path.abspath(mount_stl), meshdir).replace(os.sep, "/")
         ET.SubElement(asset, "material", name=f"{prefix}mount_mat", rgba="0.15 0.15 0.15 1", specular="0.1")
@@ -170,25 +193,32 @@ def generate(cfg):
     ref_path = reference_model(os.path.join(out_dir, "perception_reference.xml"), cfg.reference_tags,
                                cfg.board.dictionary)
     written.append(ref_path)
-    gt = cfg.calibration.get("gripper_tag")
     hand_path = None
-    if gt and sim.get("gripper_model"):
-        hand_src = os.path.join(root, sim["gripper_model"])
-        mount_stl = None
-        if "mount" in gt:
-            from .mount import write_mount
-            print_dir = os.path.join(os.path.dirname(os.path.dirname(cfg.path)), "hardware")
-            mount_stl, print_stl, T_tag, _ = write_mount(cfg, hand_src, out_dir, print_dir)
-            T_tag[:3, 3] += cfg.board.standoff * T_tag[:3, 2]
-            hand_tag = Tag(id=int(gt["id"]), size=float(gt["size"]), T=T_tag)
-            written += [mount_stl, print_stl]
-        else:
-            hand_tag = _tag(gt, cfg.board.standoff)
-        hand_path = tag_model(hand_src, os.path.join(out_dir, "hand_tagged.xml"), gt.get("body", "hand"), [hand_tag],
-                              cfg.board.dictionary, "calib_", mount_stl)
-        written.append(hand_path)
+    if cfg.calibration and sim.get("gripper_model"):
+        hand_path = _hand(cfg, os.path.join(root, sim["gripper_model"]), out_dir, written)
     written += sim_configs(cfg, run_dir, tagged_task, ref_path, hand_path)
     return written
+
+
+def _hand(cfg, hand_src, out_dir, written):
+    """Writes the hand with the active calibration target on its printed mount, plus the print files."""
+    from .mount import write_mount
+    target = make_target(cfg)
+    body = cfg.calibration.get("mount", {}).get("body", "hand")
+    print_dir = os.path.join(os.path.dirname(os.path.dirname(cfg.path)), "hardware")
+    mount_stl, print_stl, T, _ = write_mount(cfg, target, hand_src, out_dir, print_dir)
+    written += [mount_stl, print_stl]
+    T[:3, 3] += cfg.board.standoff * T[:3, 2]
+    dst = os.path.join(out_dir, "hand_tagged.xml")
+    if target.kind == "charuco":
+        written.append(write_print(target, os.path.join(print_dir, "charuco_board_print.pdf")))
+        extra = lambda asset, b, tex_dir: add_charuco(asset, b, target, T, "calib_", tex_dir)
+        path = tag_model(hand_src, dst, body, [], cfg.board.dictionary, "calib_", mount_stl, extra)
+    else:
+        tag = Tag(id=target.id, size=target.size, T=T)
+        path = tag_model(hand_src, dst, body, [tag], cfg.board.dictionary, "calib_", mount_stl)
+    written.append(path)
+    return path
 
 
 class _Dumper(yaml.SafeDumper):
@@ -216,7 +246,8 @@ def _perception_cameras(cfg):
     for c in cfg.cameras:
         if c.nominal is None or c.source.get("type") != "shm":
             continue
-        fovy = float(np.degrees(2.0 * np.arctan((c.intrinsics.height / 2.0) / c.intrinsics.K[1, 1])))
+        gt = c.intrinsics_base or c.intrinsics
+        fovy = float(np.degrees(2.0 * np.arctan((gt.height / 2.0) / gt.K[1, 1])))
         cams.append({"name": c.name, "enabled": True, "type": "fixed",
                      "pos": [float(v) for v in c.nominal[:3, 3]],
                      "look_at": [float(v) for v in c.nominal_look_at], "fovy": round(fovy, 4)})

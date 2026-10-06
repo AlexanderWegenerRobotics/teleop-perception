@@ -60,6 +60,10 @@ class CameraSpec:
     extrinsics_origin: str = "none"
     nominal: Optional[np.ndarray] = None
     nominal_look_at: Optional[list] = None
+    intrinsics_path: Optional[str] = None
+    intrinsics_base: Optional[Intrinsics] = None
+    role: str = "perception"
+    intrinsics_origin: str = "file"
 
 
 @dataclass
@@ -76,6 +80,7 @@ class Config:
     logging: dict
     sim: dict
     raw: dict = field(default_factory=dict)
+    operator_cameras: list = field(default_factory=list)
 
 
 def _load(path):
@@ -127,6 +132,7 @@ def load_intrinsics(path):
         fy = (h / 2.0) / np.tan(np.radians(float(raw["fovy_deg"])) / 2.0)
         K = np.array([[fy, 0.0, (w - 1) / 2.0], [0.0, fy, (h - 1) / 2.0], [0.0, 0.0, 1.0]])
         dist = np.zeros(5)
+        dist[:len(raw.get("dist", []))] = raw.get("dist", [])
     else:
         K = np.array([[raw["fx"], 0.0, raw["cx"]], [0.0, raw["fy"], raw["cy"]], [0.0, 0.0, 1.0]], dtype=float)
         dist = np.asarray(raw.get("dist", [0.0] * 5), dtype=float)
@@ -149,12 +155,19 @@ def load_cameras(path, mode):
         from_device = c.get("intrinsics") == "device"
         intr = None if from_device else load_intrinsics(_rel(path, c["intrinsics"]))
         ext_path = _rel(path, c.get("extrinsics", "").format(mode=mode)) if c.get("extrinsics") else None
+        cal_path = _rel(path, c["intrinsics_calibrated"].format(mode=mode)) if c.get("intrinsics_calibrated") else None
+        origin = "device" if from_device else "file"
+        base = intr
+        if cal_path and os.path.exists(cal_path):
+            intr, from_device, origin = load_intrinsics(cal_path), False, "calibration"
         nominal = None
         if "nominal" in c:
             nominal = T_world_cam_look_at(c["nominal"]["pos"], c["nominal"]["look_at"])
         cam = CameraSpec(name=c["name"], source=dict(c["source"]), intrinsics=intr,
                          intrinsics_from_device=from_device, extrinsics_path=ext_path, nominal=nominal,
-                         nominal_look_at=c["nominal"]["look_at"] if "nominal" in c else None)
+                         nominal_look_at=c["nominal"]["look_at"] if "nominal" in c else None,
+                         intrinsics_path=cal_path, intrinsics_origin=origin, intrinsics_base=base,
+                         role=c.get("role", "perception"))
         T = load_extrinsics(ext_path)
         if T is not None:
             cam.T_world_cam, cam.extrinsics_origin = T, "calibration"
@@ -190,7 +203,8 @@ def load_config(path, mode=None):
     if mode not in raw["cameras"]:
         raise ValueError(f"mode '{mode}' has no camera file in {path}")
     board = load_board(_rel(path, raw["board"]))
-    cameras = load_cameras(_rel(path, raw["cameras"][mode]), mode)
+    all_cams = load_cameras(_rel(path, raw["cameras"][mode]), mode)
+    cameras = [c for c in all_cams if c.role == "perception"]
     reference, ref_tags = load_reference(_rel(path, raw["reference"]), mode, board.standoff)
     clash = set(board.owner()) & {t.id for t in ref_tags}
     if clash:
@@ -206,6 +220,7 @@ def load_config(path, mode=None):
         path=path, mode=mode, board=board, cameras=cameras, reference=reference, reference_tags=ref_tags,
         detection=_load(_rel(path, raw["detection"])), network=_load(_rel(path, raw["network"])),
         calibration=calib, logging=logging, sim=sim, raw=raw,
+        operator_cameras=[c for c in all_cams if c.role == "operator"],
     )
 
 

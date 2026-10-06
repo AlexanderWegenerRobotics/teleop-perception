@@ -1,14 +1,33 @@
+target: charuco
+
+mount:
+  body: hand
+  meshes: [hand_0.obj, hand_1.obj, hand_2.obj, hand_3.obj, hand_4.obj]
+  grip_from: 0.075
+  clearance: 0.0003
+  wall: 0.0025
+
 gripper_tag:
   id: 80
   size: 0.040
-  body: hand
-  mount:
-    meshes: [hand_0.obj, hand_1.obj, hand_2.obj, hand_3.obj, hand_4.obj]
-    grip_from: 0.075
-    clearance: 0.0003
-    wall: 0.0025
-    plate: 0.056
-    plate_thickness: 0.003
+  plate: 0.056
+  plate_thickness: 0.003
+
+charuco:
+  dictionary: DICT_4X4_100
+  first_id: 50
+  squares: [7, 5]
+  square: 0.024
+  marker: 0.018
+  margin: 0.006
+  min_corners: 6
+  plate_thickness: 0.004
+  plate_offset_z: 0.035
+
+intrinsics:
+  estimate: true
+  dist_terms: 2
+  min_views: 15
 
 arm:
   device: arm_left
@@ -33,13 +52,43 @@ motion:
   workspace_min: [0.62, -0.18, 0.86]
   workspace_max: [0.85, 0.18, 0.92]
 
+coverage:
+  grid: [5, 3]
+  min_points_per_cell: 4
+  max_poses_per_camera: 30
+  distances_m: [0.45, 0.6]
+  tilt_deg: 25.0
+  max_turn_deg: 50.0
+  min_visible: 0.6
+  min_target_z: 0.73
+  workspace_min: [0.50, -0.35, 0.78]
+  workspace_max: [0.95, 0.35, 1.10]
+
+kinematics:
+  base_pos: [0.2, 0.0, 0.703]
+  q_min: [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, 0.0175, -2.8973]
+  q_max: [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+  margin_rad: 0.25
+
+operator:
+  overlay_file: ../../teleop-vr-interface/Config/TeleOp/overlay_desk.json
+  motion:
+    start_pos: [0.60, -0.10, 0.95]
+    search_yaw_deg: [-45, -90, 0, -135, 45, 90]
+    workspace_min: [0.45, -0.30, 0.86]
+    workspace_max: [0.80, 0.15, 1.05]
+  coverage:
+    distances_m: [0.7, 0.9]
+    workspace_min: [0.30, -0.40, 0.78]
+    workspace_max: [0.85, 0.30, 1.20]
+
 settle:
   window_s: 0.5
-  pos_tol_m: 0.0002
-  rot_tol_deg: 0.05
-  timeout_s: 6.0
-  goal_tol_m: 0.02
-  goal_tol_deg: 3.0
+  pos_tol_m: 0.0005
+  rot_tol_deg: 0.2
+  timeout_s: 8.0
+  goal_tol_m: 0.03
+  goal_tol_deg: 4.0
 
 capture:
   frames: 15

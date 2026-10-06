@@ -1,0 +1,4 @@
+width: 1280
+height: 960
+fovy_deg: 60.0
+dist: [0.06, -0.03]

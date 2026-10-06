@@ -3,10 +3,20 @@ cameras:
     source: {type: shm, name: /perception_cam_1}
     intrinsics: ../intrinsics/sim_1280x720_fovy42.yaml
     extrinsics: ../../calib/extrinsics_sim_perception_cam_1.yaml
+    intrinsics_calibrated: ../../calib/intrinsics_sim_perception_cam_1.yaml
     nominal: {pos: [1.10, -0.35, 1.20], look_at: [0.70, 0.0, 0.76]}
 
   - name: perception_cam_2
     source: {type: shm, name: /perception_cam_2}
     intrinsics: ../intrinsics/sim_1280x720_fovy42.yaml
     extrinsics: ../../calib/extrinsics_sim_perception_cam_2.yaml
+    intrinsics_calibrated: ../../calib/intrinsics_sim_perception_cam_2.yaml
     nominal: {pos: [1.10, 0.35, 1.20], look_at: [0.70, 0.0, 0.76]}
+
+  - name: desk_cam
+    role: operator
+    source: {type: shm, name: avatar_cam, apply_distortion: true}
+    intrinsics: ../intrinsics/sim_1280x960_fovy60_dist.yaml
+    extrinsics: ../../calib/extrinsics_sim_desk_cam.yaml
+    intrinsics_calibrated: ../../calib/intrinsics_sim_desk_cam.yaml
+    nominal: {pos: [0.0, -0.45, 1.5], look_at: [0.7, 0.05, 0.72]}

@@ -28,8 +28,10 @@ def main():
     s.add_argument("--blur", type=float, default=0.0)
     s.add_argument("--save", default=None)
 
-    k = sub.add_parser("calibrate", help="hand-eye calibration with the gripper tag")
+    k = sub.add_parser("calibrate", help="camera calibration with the target on the hand (extrinsics, intrinsics with the ChArUco board)")
     k.add_argument("--samples", default=None, help="re-solve from a saved calib/samples_*.npz without moving the arm")
+    k.add_argument("--role", choices=["perception", "operator"], default="perception",
+                   help="which cameras: the pose-estimation cameras or the operator (VR video) camera")
 
     e = sub.add_parser("evaluate", help="error summary of a logged run")
     e.add_argument("run_dir")
@@ -54,7 +56,7 @@ def main():
         run(cfg, a.scenes, a.jitter, a.seed, a.tag_shift_mm, a.noise, a.blur, a.save)
     elif a.cmd == "calibrate":
         from .calibrate import calibrate
-        calibrate(cfg, a.samples)
+        calibrate(cfg, a.samples, a.role)
 
 
 if __name__ == "__main__":

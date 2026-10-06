@@ -23,24 +23,66 @@ class Frame:
     seq: int
 
 
-def _attach_posix(name):
-    """Attaches to an existing POSIX shared memory segment without letting Python unlink it at exit."""
-    from multiprocessing import shared_memory
-    try:
-        return shared_memory.SharedMemory(name=name, create=False, track=False)
-    except TypeError:
-        shm = shared_memory.SharedMemory(name=name, create=False)
-        from multiprocessing import resource_tracker
-        resource_tracker.unregister(shm._name, "shared_memory")
-        return shm
+class _PosixShm:
+    """Read-only view of a POSIX shared memory segment opened under its exact name (no prefix added)."""
+
+    def __init__(self, name):
+        import mmap
+        import os
+        import _posixshmem
+        self._os = os
+        fd = None
+        for n in (name, "/" + name.lstrip("/")):
+            try:
+                fd = _posixshmem.shm_open(n, os.O_RDONLY, 0o600)
+                break
+            except OSError:
+                continue
+        if fd is None:
+            raise FileNotFoundError(name)
+        self.fd = fd
+        self.size = os.fstat(fd).st_size
+        self._mm = mmap.mmap(fd, self.size, prot=mmap.PROT_READ)
+        self.buf = memoryview(self._mm)
+
+    def close(self):
+        """Unmaps and closes, never unlinks."""
+        self.buf.release()
+        self._mm.close()
+        self._os.close(self.fd)
+
+
+class Distorter:
+    """Applies a known lens distortion to ideal pinhole images (sim ground-truth tests)."""
+
+    def __init__(self, intr, iters=30):
+        w, h = intr.width, intr.height
+        K, d = intr.K, np.zeros(5)
+        d[:len(np.ravel(intr.dist)[:5])] = np.ravel(intr.dist)[:5]
+        k1, k2, p1, p2, k3 = d
+        u, v = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
+        xd, yd = (u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1]
+        x, y = xd.copy(), yd.copy()
+        for _ in range(iters):
+            r2 = x * x + y * y
+            rad = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+            x = (xd - (2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x))) / rad
+            y = (yd - (p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y)) / rad
+        self.map1, self.map2 = cv2.convertMaps((x * K[0, 0] + K[0, 2]).astype(np.float32),
+                                               (y * K[1, 1] + K[1, 2]).astype(np.float32), cv2.CV_16SC2)
+
+    def __call__(self, img):
+        """Distorted version of an ideal image."""
+        return cv2.remap(img, self.map1, self.map2, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
 
 class ShmSource:
     """Reads the newest frame from the simulator's SharedFrameBuffer (shared_memory.hpp)."""
 
-    def __init__(self, camera, name):
+    def __init__(self, camera, name, distort=None):
         self.camera = camera
         self.name = name
+        self.distort = distort
         self._buf = None
         self._handle = None
         self._last_count = None
@@ -68,7 +110,7 @@ class ShmSource:
             self._view = memoryview(self._buf).cast("B")
         else:
             try:
-                self._buf = _attach_posix(self.name.lstrip("/"))
+                self._buf = _PosixShm(self.name)
             except (FileNotFoundError, OSError):
                 return False
             if self._buf.size < BUFFER_SIZE:
@@ -101,6 +143,8 @@ class ShmSource:
             rgb = np.frombuffer(self._view[start:start + w * h * 3], dtype=np.uint8).reshape(h, w, 3)
             gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
             del rgb
+            if self.distort is not None:
+                gray = self.distort(gray)
             idx2 = self._header()[0]
             if (idx2 - idx) % (1 << 32) < SHM_N_SLOTS - 1:
                 self._last_count = count
@@ -183,7 +227,8 @@ def make_source(cam):
     s = dict(cam.source)
     kind = s.pop("type")
     if kind == "shm":
-        return ShmSource(cam.name, s["name"])
+        distort = Distorter(cam.intrinsics_base or cam.intrinsics) if s.get("apply_distortion") else None
+        return ShmSource(cam.name, s["name"], distort)
     if kind == "realsense":
         return RealSenseSource(cam.name, **s)
     raise ValueError(f"unknown source type '{kind}' for camera {cam.name}")

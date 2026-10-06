@@ -36,7 +36,8 @@ def build_scene(cfg, table_z=0.7):
     for c in cfg.cameras:
         if c.nominal is None:
             continue
-        fovy = np.degrees(2.0 * np.arctan((c.intrinsics.height / 2.0) / c.intrinsics.K[1, 1]))
+        gt = c.intrinsics_base or c.intrinsics
+        fovy = np.degrees(2.0 * np.arctan((gt.height / 2.0) / gt.K[1, 1]))
         pos = c.nominal[:3, 3]
         wb.add_camera(name=c.name, pos=pos, quat=mj_quat_look_at(pos, pos + c.nominal[:3, 2]), fovy=fovy)
     bodies = {}
@@ -67,6 +68,8 @@ def _place(model, data, bodies, by_name, rng, jitter):
     import mujoco
     for name, b in bodies.items():
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b)
+        if model.body_jntadr[bid] < 0:
+            continue
         adr = model.jnt_qposadr[model.body_jntadr[bid]]
         p = np.array(by_name[name]["pose"]["position"], dtype=float)
         q = np.array(by_name[name]["pose"]["orientation"], dtype=float)

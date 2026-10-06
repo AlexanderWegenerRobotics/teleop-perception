@@ -12,7 +12,7 @@ dependencies = [
     "opencv-python>=4.7",
     "scipy",
     "pyyaml",
-    "msgpack",
+    "msgpack", "pillow",
     "trimesh",
     "manifold3d",
 ]

@@ -1,17 +1,23 @@
+import dataclasses
 import os
 import time
+import warnings
 
 import cv2
 import numpy as np
 import yaml
-from scipy.optimize import least_squares
 
 from . import wire
 from .config import Intrinsics, calib_dir
 from .detection import TagDetector
-from .geometry import T_from_rvec, average_poses, inv_T, make_T, pose_error, rvec_from_T, to_list
+from .geometry import T_from_rvec, make_T, pose_error, to_list
+from .overlay import overlay_K, overlay_view, pixel_error, project, workspace_points, write_overlay
+from .kinematics import Arm
+from .planner import candidates, motion_cost, order_poses
 from .reference import workspace_drift
+from .solve import cell_hits, coverage_map, model_shift_px, solve
 from .sources import make_source
+from .targets import make_target
 
 
 def tag_square(size):
@@ -20,25 +26,24 @@ def tag_square(size):
     return np.array([[-h, h, 0.0], [h, h, 0.0], [h, -h, 0.0], [-h, -h, 0.0]])
 
 
-def generate_poses(T0, motion, rng):
-    """Random poses around T0 inside the workspace box, ordered to keep travel short."""
+def generate_poses(T0, motion, rng, model=None, q0=None):
+    """Random poses around T0 inside the workspace box and reachable from q0 within the joint limits, short travel first."""
     rng_pos = np.asarray(motion.get("pos_range_m", [0.08, 0.08, 0.06]), dtype=float)
     rot = np.radians(float(motion.get("rot_range_deg", 25.0)))
     lo = np.asarray(motion.get("workspace_min", [-np.inf] * 3), dtype=float)
     hi = np.asarray(motion.get("workspace_max", [np.inf] * 3), dtype=float)
-    poses = []
-    for _ in range(int(motion.get("n_poses", 18))):
+    poses, n = [], int(motion.get("n_poses", 18))
+    for _ in range(50 * n):
+        if len(poses) == n:
+            break
         p = np.clip(T0[:3, 3] + rng.uniform(-rng_pos, rng_pos), lo, hi)
         axis = rng.normal(size=3)
         axis /= np.linalg.norm(axis)
         R, _ = cv2.Rodrigues(axis * rng.uniform(0.3, 1.0) * rot)
-        poses.append(make_T(T0[:3, :3] @ R, p))
-    ordered, cur = [], T0
-    while poses:
-        k = int(np.argmin([np.linalg.norm(P[:3, 3] - cur[:3, 3]) for P in poses]))
-        cur = poses.pop(k)
-        ordered.append(cur)
-    return ordered
+        P = make_T(T0[:3, :3] @ R, p)
+        if model is None or model.follow(q0, P) is not None:
+            poses.append(P)
+    return order_poses(poses, T0)
 
 
 def _ippe(corners, size, K, dist):
@@ -48,69 +53,36 @@ def _ippe(corners, size, K, dist):
     return T_from_rvec(rvecs[k], tvecs[k])
 
 
-def _hand_eye_init(T_we, T_ct):
-    """Closed-form eye-to-hand start (Park & Martin on A Y = Y B): returns (T_world_cam, T_ee_tag)."""
-    M = np.zeros((3, 3))
-    rows, rhs, pairs = [], [], []
-    n = len(T_we)
-    for i in range(n):
-        for j in range(i + 1, n):
-            A = inv_T(T_we[j]) @ T_we[i]
-            B = inv_T(T_ct[j]) @ T_ct[i]
-            a, _ = cv2.Rodrigues(A[:3, :3])
-            b, _ = cv2.Rodrigues(B[:3, :3])
-            if np.linalg.norm(a) < np.radians(2.0):
-                continue
-            M += b @ a.T
-            pairs.append((A, B))
-    if len(pairs) < 3:
-        raise RuntimeError("calibration poses have too little rotation to solve the hand-eye problem")
-    w, V = np.linalg.eigh(M.T @ M)
-    R_y = V @ np.diag(1.0 / np.sqrt(np.maximum(w, 1e-12))) @ V.T @ M.T
-    U, _, Vt = np.linalg.svd(R_y)
-    R_y = U @ np.diag([1.0, 1.0, np.linalg.det(U @ Vt)]) @ Vt
-    for A, B in pairs:
-        rows.append(A[:3, :3] - np.eye(3))
-        rhs.append(R_y @ B[:3, 3] - A[:3, 3])
-    t_y = np.linalg.lstsq(np.vstack(rows), np.concatenate(rhs), rcond=None)[0]
-    T_et = make_T(R_y, t_y)
-    T_wc = average_poses([T @ T_et @ inv_T(C) for T, C in zip(T_we, T_ct)])
-    return T_wc, T_et
-
-
-def solve_hand_eye(samples, size, K, dist):
-    """Camera-in-world and tag-on-gripper from [(T_world_ee, corners)], refined on reprojection error."""
-    T_we = [T for T, _ in samples]
-    T_ct = [_ippe(c, size, K, dist) for _, c in samples]
-    T_wc0, T_et0 = _hand_eye_init(T_we, T_ct)
-    T_cw0 = inv_T(T_wc0)
-    obj = tag_square(size)
-
-    def unpack(x):
-        """Parameter vector to (T_cam_world, T_ee_tag)."""
-        return T_from_rvec(x[0:3], x[3:6]), T_from_rvec(x[6:9], x[9:12])
-
-    def residuals(x):
-        """Tag corner reprojection error over all samples."""
-        T_cw, T_et = unpack(x)
-        res = []
-        for T_we, c in samples:
-            rv, tv = rvec_from_T(T_cw @ T_we @ T_et)
-            proj, _ = cv2.projectPoints(obj, rv, tv, K, dist)
-            res.append((proj.reshape(-1, 2) - c).ravel())
-        return np.concatenate(res)
-
-    r1, t1 = rvec_from_T(T_cw0)
-    r2, t2 = rvec_from_T(T_et0)
-    sol = least_squares(residuals, np.r_[r1.ravel(), t1.ravel(), r2.ravel(), t2.ravel()], loss="huber",
-                        f_scale=1.0, x_scale="jac")
-    T_cw, T_et = unpack(sol.x)
-    per = np.sqrt(np.mean(sol.fun.reshape(len(samples), 4, 2) ** 2, axis=(1, 2)) * 2.0)
-    return inv_T(T_cw), T_et, per
-
-
 class ArmNotFollowing(RuntimeError):
-    """The arm ignored the command stream, usually because the avatar dropped POLICY to HOLD."""
+    """The arm ignored the command stream: it faulted, or the avatar dropped POLICY to HOLD."""
+
+
+def _arm_model(cfg):
+    """Kinematic model for checking moves against the joint limits, or None if not configured."""
+    spec = cfg.calibration.get("kinematics")
+    return Arm(spec) if spec else None
+
+
+def _q(arm):
+    """Measured joint positions; raises if the avatar does not send them."""
+    q = np.asarray(arm.latest()[2]["joints"], dtype=float)
+    if not np.any(q):
+        raise ArmNotFollowing("the arm state has no joint positions (all zero), so moves cannot be checked against "
+                              "the joint limits. Rebuild the avatar with joint_positions filled in arm_control.cpp.")
+    return q
+
+
+def _feasible(model, arm, T):
+    """True if the straight move from the current joints to T keeps every joint off its limits."""
+    return model is None or model.follow(_q(arm), T) is not None
+
+
+def _check_fault(arm):
+    """Raises if the arm left ENGAGED or reports a fault."""
+    s = arm.latest()[2]
+    if s["fault"] or s["state"] != wire.ENGAGED:
+        raise ArmNotFollowing(f"arm is not ENGAGED (state {s['state']}, fault code {s['fault']}). Reset it "
+                              f"(arm_reset) and look for FRANKA ERROR in avatar_stdout.log.")
 
 
 def _settle(arm, T, st):
@@ -123,6 +95,7 @@ def _settle(arm, T, st):
                               goal_tol=(st.get("goal_tol_m", 0.02), st.get("goal_tol_deg", 3.0)))
     if T_meas is not None:
         return T_meas
+    _check_fault(arm)
     gap, errors, err_msg = arm.pop_stream_stats()
     asked_p, asked_r = pose_error(T_start, T)
     moved_p, moved_r = pose_error(T_start, arm.latest()[1])
@@ -137,8 +110,8 @@ def _settle(arm, T, st):
     return None
 
 
-def face_cameras(arm, sources, cams, detector, tag_id, T0, motion, st):
-    """Moves to the start position and turns the hand about its tool axis until the gripper tag faces the cameras."""
+def face_cameras(arm, sources, target, T0, motion, st, model=None):
+    """Moves to the start position and turns the hand about its tool axis until the target faces the cameras."""
     T = T0.copy()
     if motion.get("start_pos") is not None:
         T[:3, 3] = np.asarray(motion["start_pos"], dtype=float)
@@ -146,22 +119,25 @@ def face_cameras(arm, sources, cams, detector, tag_id, T0, motion, st):
     for yaw in motion.get("search_yaw_deg", [0, 45, -45, 90, -90, 135, -135, 180]):
         R, _ = cv2.Rodrigues(np.array([0.0, 0.0, np.radians(yaw)]))
         cand = make_T(T[:3, :3] @ R, T[:3, 3])
+        if not _feasible(model, arm, cand):
+            print(f"[calib] start yaw {yaw:+d} deg: too close to a joint limit, skipped")
+            continue
         if _settle(arm, cand, st) is None:
             print(f"[calib] start yaw {yaw:+d} deg: not reached, skipped")
             continue
-        seen = sum(c is not None for c in _capture(sources, cams, detector, tag_id, 5).values())
-        print(f"[calib] start yaw {yaw:+d} deg: tag seen by {seen}/{len(sources)} cameras")
+        seen = sum(c is not None for c in _capture(sources, target, 5).values())
+        print(f"[calib] start yaw {yaw:+d} deg: target seen by {seen}/{len(sources)} cameras")
         if seen > best_n:
             best, best_n = cand, seen
         if seen == len(sources):
             break
     if best is None:
-        raise RuntimeError("gripper tag not visible from any start yaw -- check the cap and start_pos")
+        raise RuntimeError("calibration target not visible from any start yaw -- check the mount and start_pos")
     return best
 
 
-def _capture(sources, cams, detector, tag_id, n_frames, timeout=5.0):
-    """Collects n_frames per camera and returns {camera: mean corners of tag_id or None}."""
+def _capture(sources, target, n_frames, timeout=5.0):
+    """Collects n_frames per camera; returns {camera: mean image points (NaN where unseen) or None}."""
     got = {c: [] for c in sources}
     seen = {c: 0 for c in sources}
     t_end = time.monotonic() + timeout
@@ -173,11 +149,21 @@ def _capture(sources, cams, detector, tag_id, n_frames, timeout=5.0):
             if f is None:
                 continue
             seen[name] += 1
-            dets = detector.detect(f.gray)
-            if tag_id in dets:
-                got[name].append(dets[tag_id])
+            got[name].append(target.detect(f.gray))
         time.sleep(0.002)
-    return {c: (np.mean(v, axis=0) if len(v) >= max(1, n_frames // 2) else None) for c, v in got.items()}
+    out = {}
+    for c, v in got.items():
+        if not v:
+            out[c] = None
+            continue
+        A = np.array(v)
+        n = np.sum(~np.isnan(A[:, :, 0]), axis=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            pts = np.nanmean(A, axis=0)
+        pts[n < max(1, n_frames // 2)] = np.nan
+        out[c] = pts if np.sum(~np.isnan(pts[:, 0])) >= target.min_points else None
+    return out
 
 
 def measure_reference(sources, cams, detector, ref_tags, n_frames):
@@ -185,7 +171,7 @@ def measure_reference(sources, cams, detector, ref_tags, n_frames):
     ids = {t.id: t for t in ref_tags}
     seen = {c: {} for c in sources}
     count = {c: 0 for c in sources}
-    t_end = time.monotonic() + 10.0
+    t_end = time.monotonic() + 20.0
     while time.monotonic() < t_end and any(v < n_frames for v in count.values()):
         for name, src in sources.items():
             f = src.read()
@@ -196,6 +182,9 @@ def measure_reference(sources, cams, detector, ref_tags, n_frames):
                 if tid in ids:
                     seen[name].setdefault(tid, []).append(c)
         time.sleep(0.002)
+    for name, n in count.items():
+        if n < n_frames:
+            print(f"[calib] {name}: only {n}/{n_frames} frames for the reference tags -- is the sim running?")
     out = {}
     for name, tags in seen.items():
         intr = cams[name].intrinsics
@@ -209,10 +198,114 @@ def measure_reference(sources, cams, detector, ref_tags, n_frames):
     return out
 
 
-def _collect(cfg, cams, sources, detector):
-    """Engages the arm, finds a start yaw, visits the calibration poses and returns the samples (None if aborted)."""
+def _visit_one(arm, P, sources, target, samples, st, cap):
+    """Settles at P and captures the target in every camera; returns the cameras that saw it, or None if not reached."""
+    if _settle(arm, P, st) is None:
+        return None
+    t0 = time.monotonic()
+    pts = _capture(sources, target, int(cap.get("frames", 15)))
+    T_mean = arm.measured_since(t0)
+    T_mean = arm.latest()[1] if T_mean is None else T_mean
+    seen = [n for n, p in pts.items() if p is not None]
+    for n in seen:
+        samples[n].append((T_mean, pts[n]))
+    return seen
+
+
+def _visit(arm, poses, sources, target, samples, st, cap, label, model=None):
+    """Visits a fixed list of poses, skipping moves that would bring a joint near its limit."""
+    for k, P in enumerate(poses):
+        if not _feasible(model, arm, P):
+            print(f"[calib] {label} {k + 1}/{len(poses)}: too close to a joint limit from here, skipped")
+            continue
+        seen = _visit_one(arm, P, sources, target, samples, st, cap)
+        msg = "arm did not settle, skipped" if seen is None else f"target seen by {seen or 'no camera'}"
+        print(f"[calib] {label} {k + 1}/{len(poses)}: {msg}")
+
+
+def _wants_intrinsics(cfg, target):
+    """True if this run estimates intrinsics."""
+    return target.supports_intrinsics and bool(cfg.calibration.get("intrinsics", {}).get("estimate", False))
+
+
+def _print_map(name, hits, need):
+    """Prints which image cells the target has covered."""
+    print(f"[calib] {name} image coverage ('#' covered, '+' few points, '.' none):")
+    for row in coverage_map(hits, need):
+        print(f"          {row}")
+
+
+def _next_pose(arm, model, todo, open_):
+    """Cheapest (index, option) among the open cells whose move stays off the joint limits, or None."""
+    cur = arm.latest()[1]
+    q = None if model is None else _q(arm)
+    best, best_cost = None, np.inf
+    for k in open_:
+        for o, P in enumerate(todo[k][1]):
+            if model is not None and model.follow(q, P) is None:
+                continue
+            cost = motion_cost(cur, P)
+            if cost < best_cost:
+                best, best_cost = (k, o), cost
+            break
+    return best
+
+
+def _cover(arm, cfg, cams, sources, target, samples, T0, st, cap, model=None):
+    """Per camera and distance: keeps visiting the cheapest feasible pose for an image cell not yet covered at that distance."""
+    cov = cfg.calibration.get("coverage", {})
+    grid = tuple(int(v) for v in cov.get("grid", [5, 3]))
+    need = int(cov.get("min_points_per_cell", 4))
+    max_poses = int(cov.get("max_poses_per_camera", 30))
+    for name, cam in cams.items():
+        intr = cam.intrinsics
+        size = (intr.width, intr.height)
+        try:
+            r = solve(samples[name], target.points, intr.K, intr.dist)
+        except (RuntimeError, ValueError, cv2.error) as e:
+            print(f"[calib] {name}: no coverage poses, first-stage solve failed ({e})")
+            continue
+        cand = candidates(r["T_world_cam"], intr.K, size, target.points, r["T_ee_target"], T0[:3, :3], cov)
+        n_d = len(cov.get("distances_m", [0.5]))
+        print(f"[calib] {name}: {len(cand)} of {grid[0] * grid[1] * n_d} cell/distance poses inside the workspace")
+        n = 0
+        for dist_i in range(n_d):
+            own = []
+            todo = [(c, list(opts)) for i, c, opts in cand if i == dist_i]
+            recovered = False
+            while todo and n < max_poses:
+                hits = cell_hits(own, size, grid)
+                open_ = [k for k, (c, opts) in enumerate(todo) if hits[c[1], c[0]] < need and opts]
+                if not open_:
+                    break
+                pick = _next_pose(arm, model, todo, open_)
+                if pick is None:
+                    if recovered or not _feasible(model, arm, T0):
+                        print(f"[calib] {name} distance {dist_i + 1}/{n_d}: no remaining cell reachable within the "
+                              f"joint limits")
+                        break
+                    print(f"[calib] {name}: nothing reachable from here, returning to the start pose")
+                    _settle(arm, T0, st)
+                    recovered = True
+                    continue
+                recovered = False
+                k, o = pick
+                cell, opts = todo[k]
+                P = opts.pop(o)
+                n += 1
+                before = len(samples[name])
+                seen = _visit_one(arm, P, sources, target, samples, st, cap)
+                if len(samples[name]) > before:
+                    own.append(samples[name][-1])
+                    opts.clear()
+                msg = "not reached" if seen is None else ("seen" if name in seen else "not seen")
+                print(f"[calib] {name} distance {dist_i + 1}/{n_d} cell {cell}: {msg}")
+        _print_map(name, cell_hits(samples[name], size, grid), need)
+
+
+def _collect(cfg, cams, sources, target):
+    """Engages the arm, finds a start yaw, visits the calibration (and coverage) poses; returns samples or None."""
     c = cfg.calibration
-    gt = c["gripper_tag"]
     from .arm import ArmClient
     arm = ArmClient(c["arm"], c.get("motion", {}))
     samples = {name: [] for name in cams}
@@ -232,21 +325,13 @@ def _collect(cfg, cams, sources, detector):
         st = c.get("settle", {})
         cap = c.get("capture", {})
         T_home = T0
-        T0 = face_cameras(arm, sources, cams, detector, int(gt["id"]), T0, c.get("motion", {}), st)
-        poses = generate_poses(T0, c.get("motion", {}), np.random.default_rng(int(c["motion"].get("seed", 0))))
-        for k, P in enumerate(poses):
-            T_meas = _settle(arm, P, st)
-            if T_meas is None:
-                print(f"[calib] pose {k + 1}/{len(poses)}: arm did not settle, skipped")
-                continue
-            t0 = time.monotonic()
-            corners = _capture(sources, cams, detector, int(gt["id"]), int(cap.get("frames", 15)))
-            T_mean = arm.measured_since(t0)
-            T_mean = T_meas if T_mean is None else T_mean
-            seen = [n for n, cr in corners.items() if cr is not None]
-            for n in seen:
-                samples[n].append((T_mean, corners[n]))
-            print(f"[calib] pose {k + 1}/{len(poses)}: tag seen by {seen or 'no camera'}")
+        model = _arm_model(cfg)
+        T0 = face_cameras(arm, sources, target, T0, c.get("motion", {}), st, model)
+        poses = generate_poses(T0, c.get("motion", {}), np.random.default_rng(int(c["motion"].get("seed", 0))),
+                               model, None if model is None else _q(arm))
+        _visit(arm, poses, sources, target, samples, st, cap, "pose", model)
+        if _wants_intrinsics(cfg, target):
+            _cover(arm, cfg, cams, sources, target, samples, T0, st, cap, model)
         arm.move_to(T_home)
         arm.wait_settled(0.5, 1e-3, 0.5, 10.0)
     except KeyboardInterrupt:
@@ -264,73 +349,209 @@ def _collect(cfg, cams, sources, detector):
     return samples
 
 
-def load_samples(path, cams):
-    """Samples saved by an earlier calibration run, {camera: [(T_world_ee, corners)]}."""
+def save_samples(path, samples, target):
+    """Writes {camera: [(T_world_ee, image points)]} to an npz."""
+    data = {"target": np.array(target.kind)}
+    for n, v in samples.items():
+        if v:
+            data[f"{n}_T"] = np.array([x[0] for x in v])
+            data[f"{n}_pts"] = np.array([x[1] for x in v])
+    np.savez(path, **data)
+
+
+def load_samples(path, cams, target):
+    """Samples saved by an earlier calibration run, {camera: [(T_world_ee, image points)]}."""
     z = np.load(path)
-    return {n: list(zip(z[f"{n}_T"], z[f"{n}_corners"])) if f"{n}_T" in z else [] for n in cams}
+    kind = str(z["target"]) if "target" in z else "gripper_tag"
+    if kind != target.kind:
+        raise ValueError(f"{path} was recorded with the {kind} target, calibration.yaml selects {target.kind}")
+    out = {}
+    for n in cams:
+        key = f"{n}_pts" if f"{n}_pts" in z else f"{n}_corners"
+        out[n] = list(zip(z[f"{n}_T"], z[key])) if f"{n}_T" in z else []
+    return out
 
 
-def calibrate(cfg, samples_path=None):
-    """Moves the arm through calibration poses (or reuses saved samples), solves every camera and re-measures the reference tags."""
+def _fmt_K(K, d):
+    """One-line intrinsics summary."""
+    return (f"fx {K[0, 0]:.2f} fy {K[1, 1]:.2f} cx {K[0, 2]:.2f} cy {K[1, 2]:.2f} "
+            f"dist [{', '.join(f'{v:+.4f}' for v in np.ravel(d)[:5])}]")
+
+
+def _report_intrinsics(name, r, base, base_label, size, cov):
+    """Prints the estimated intrinsics, their uncertainty, the image coverage and the change against the base model."""
+    sx = r["sigma_K"]
+    print(f"[calib] {name}: intrinsics {_fmt_K(r['K'], r['dist'])}")
+    print(f"[calib] {name}: 1-sigma fx {sx[0]:.2f} fy {sx[1]:.2f} cx {sx[2]:.2f} cy {sx[3]:.2f} px")
+    grid = tuple(int(v) for v in cov.get("grid", [5, 3]))
+    _print_map(name, cell_hits(r["samples"], size, grid), int(cov.get("min_points_per_cell", 4)))
+    if base is not None:
+        mx, mn = model_shift_px(base.K, base.dist, r["K"], r["dist"], size)
+        print(f"[calib] {name}: vs {base_label} ({_fmt_K(base.K, base.dist)}): {mn:.2f} px mean, {mx:.2f} px max "
+              f"over the image")
+
+
+def _solve_camera(s, target, intr, est, dist_terms, min_valid, name):
+    """Solves one camera and drops outlier poses once."""
+    r = solve(s, target.points, intr.K, intr.dist, est, dist_terms)
+    per = r["rms_px"]
+    good = per <= max(1.0, 3.0 * float(np.median(per)))
+    if not good.all() and good.sum() >= min_valid:
+        print(f"[calib] {name}: dropping {int((~good).sum())} outlier poses")
+        r = solve([x for x, g in zip(r["samples"], good) if g], target.points, intr.K, intr.dist, est, dist_terms)
+    return r
+
+
+def _merge(base, over):
+    """Recursive dict merge, over wins."""
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def _for_role(cfg, role):
+    """Config whose cameras and calibration settings are those of one camera role."""
+    if role == "perception":
+        return cfg
+    cams = cfg.operator_cameras if role == "operator" else []
+    if not cams:
+        raise SystemExit(f"[calib] no cameras with role '{role}' in the camera file for mode '{cfg.mode}'")
+    calib = _merge({k: v for k, v in cfg.calibration.items() if k != role}, cfg.calibration.get(role, {}))
+    return dataclasses.replace(cfg, cameras=cams, calibration=calib)
+
+
+def _save_reference(path, ref, stamp, mode):
+    """Merges the newly measured reference observations into the reference file."""
+    old = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            old = (yaml.safe_load(f) or {}).get("cameras", {})
+    old.update(ref)
+    with open(path, "w") as f:
+        yaml.safe_dump({"date": stamp, "mode": mode, "cameras": old}, f, sort_keys=False)
+
+
+def _report_overlay(cfg, name, cam, r, size, stamp, base):
+    """Writes the VR overlay viewpoint of an operator camera and, in sim, its pixel error against the truth."""
     c = cfg.calibration
-    gt = c["gripper_tag"]
+    view = overlay_view(r["T_world_cam"], r["K"], size)
+    out = os.path.join(calib_dir(cfg), f"overlay_{cfg.mode}_{name}.json")
+    write_overlay(out, view, size, name, stamp)
+    print(f"[calib] {name}: overlay pos {view['pos']} look_at {view['look_at']} up {view['up']} "
+          f"hfov {view['capture_fov']:.2f} deg -> {out}")
+    vr = c.get("overlay_file")
+    if vr:
+        vr = os.path.normpath(os.path.join(os.path.dirname(cfg.path), vr))
+        if os.path.exists(vr):
+            write_overlay(vr, view, size, name, stamp)
+            print(f"[calib] {name}: updated {vr}")
+        else:
+            print(f"[calib] {name}: overlay_file {vr} not found, copy {out} over by hand")
+    if abs(r["K"][0, 2] - (size[0] - 1) / 2.0) > 2.0 or abs(r["K"][1, 2] - (size[1] - 1) / 2.0) > 2.0 \
+            or np.max(np.abs(r["dist"])) > 1e-3:
+        print(f"[calib] {name}: principal point / distortion are not what the overlay assumes -- the video must be "
+              f"undistorted to the overlay pinhole")
+    if cam.nominal is None or base is None:
+        return
+    ws = c.get("coverage", {})
+    P = workspace_points(ws.get("workspace_min", [0.3, -0.4, 0.7]), ws.get("workspace_max", [0.9, 0.4, 1.1]))
+    truth = project(cam.nominal, base.K, base.dist, P)
+    ideal = project(cam.nominal, base.K, None, P)
+    calib = project(r["T_world_cam"], r["K"], r["dist"], P)
+    ov = project(r["T_world_cam"], overlay_K(view, size), None, P)
+    for label, a, b in (("calibrated camera vs truth", calib, truth),
+                        ("overlay vs undistorted video", ov, ideal),
+                        ("overlay vs raw video (no undistortion)", ov, truth)):
+        e = pixel_error(a, b, size)
+        if e:
+            print(f"[calib] {name}: {label}: {e[0]:.2f} px mean, {e[1]:.2f} px max over the workspace")
+
+
+def calibrate(cfg, samples_path=None, role="perception"):
+    """Moves the arm through calibration poses (or reuses saved samples), solves every camera and re-measures the reference tags."""
+    cfg = _for_role(cfg, role)
+    c = cfg.calibration
+    target = make_target(cfg)
+    ic = c.get("intrinsics", {})
+    dist_terms = int(ic.get("dist_terms", 5))
     detector = TagDetector(cfg.board.dictionary, cfg.detection.get("detector", {}))
     cams = {cam.name: cam for cam in cfg.cameras}
     sources = {name: make_source(cam) for name, cam in cams.items()}
+    base = {}
     for name, src in sources.items():
-        if cams[name].intrinsics_from_device:
+        cam = cams[name]
+        if cam.source.get("type") == "realsense":
             w, h, K, dist = src.intrinsics()
-            cams[name].intrinsics = Intrinsics(width=w, height=h, K=K, dist=dist)
+            base[name] = (Intrinsics(width=w, height=h, K=K, dist=dist), "factory intrinsics")
+            if cam.intrinsics_from_device:
+                cam.intrinsics = base[name][0]
+        elif cam.intrinsics_base is not None:
+            base[name] = (cam.intrinsics_base, "intrinsics file")
     out_dir = calib_dir(cfg)
     os.makedirs(out_dir, exist_ok=True)
     if samples_path:
-        samples = load_samples(samples_path, cams)
+        samples = load_samples(samples_path, cams, target)
         print(f"[calib] re-solving from {samples_path}")
     else:
-        samples = _collect(cfg, cams, sources, detector)
+        samples = _collect(cfg, cams, sources, target)
         if samples is None:
             for s in sources.values():
                 s.close()
             return
     stamp = time.strftime("%Y%m%d_%H%M%S")
     if not samples_path:
-        np.savez(os.path.join(out_dir, f"samples_{cfg.mode}_{stamp}.npz"),
-                 **{f"{n}_T": np.array([s[0] for s in v]) for n, v in samples.items() if v},
-                 **{f"{n}_corners": np.array([s[1] for s in v]) for n, v in samples.items() if v})
+        tag = "" if role == "perception" else f"{role}_"
+        save_samples(os.path.join(out_dir, f"samples_{cfg.mode}_{tag}{stamp}.npz"), samples, target)
     min_valid = int(c.get("capture", {}).get("min_valid_poses", 10))
     ref_points = [t.T[:3, 3] for t in cfg.reference_tags]
     for name, cam in cams.items():
         s = samples[name]
         if len(s) < min_valid:
-            print(f"[calib] {name}: only {len(s)} valid poses (< {min_valid}), extrinsics not written")
+            print(f"[calib] {name}: only {len(s)} valid poses (< {min_valid}), nothing written")
             continue
         intr = cam.intrinsics
-        T_wc, T_et, per = solve_hand_eye(s, float(gt["size"]), intr.K, intr.dist)
-        good = per <= max(1.0, 3.0 * float(np.median(per)))
-        if not good.all() and good.sum() >= min_valid:
-            print(f"[calib] {name}: dropping {int((~good).sum())} outlier poses")
-            s = [x for x, g in zip(s, good) if g]
-            T_wc, T_et, per = solve_hand_eye(s, float(gt["size"]), intr.K, intr.dist)
-        print(f"[calib] {name}: {len(s)} poses, reprojection rms median {np.median(per):.3f} px, max {per.max():.3f} px")
+        size = (intr.width, intr.height)
+        est = _wants_intrinsics(cfg, target) and len(s) >= int(ic.get("min_views", 15))
+        if _wants_intrinsics(cfg, target) and not est:
+            print(f"[calib] {name}: only {len(s)} views, intrinsics kept ({cam.intrinsics_origin})")
+        r = _solve_camera(s, target, intr, est, dist_terms, min_valid, name)
+        per = r["rms_px"]
+        print(f"[calib] {name}: {len(per)} poses, reprojection rms median {np.median(per):.3f} px, max {per.max():.3f} px")
+        if est:
+            b, label = base.get(name, (None, ""))
+            _report_intrinsics(name, r, b, label, size, c.get("coverage", {}))
         if cam.nominal is not None and ref_points:
-            print(f"[calib] {name}: vs nominal sim camera {workspace_drift(T_wc, cam.nominal, ref_points) * 1000:.3f} mm"
+            print(f"[calib] {name}: vs nominal sim camera {workspace_drift(r['T_world_cam'], cam.nominal, ref_points) * 1000:.3f} mm"
                   f" (mean displacement at the reference tags)")
         with open(cam.extrinsics_path, "w") as f:
-            yaml.safe_dump({"camera": name, "mode": cfg.mode, "date": stamp, "n_poses": len(s),
-                            "rms_px_median": float(np.median(per)), "rms_px_max": float(per.max()),
-                            "T_world_cam": to_list(T_wc), "T_ee_tag": to_list(T_et)}, f, sort_keys=False)
-        cam.T_world_cam = T_wc
+            yaml.safe_dump({"camera": name, "mode": cfg.mode, "date": stamp, "target": target.kind,
+                            "n_poses": len(per), "rms_px_median": float(np.median(per)), "rms_px_max": float(per.max()),
+                            "intrinsics": "estimated" if est else cam.intrinsics_origin,
+                            "T_world_cam": to_list(r["T_world_cam"]), "T_ee_target": to_list(r["T_ee_target"])},
+                           f, sort_keys=False)
+        cam.T_world_cam = r["T_world_cam"]
         print(f"[calib] wrote {cam.extrinsics_path}")
+        if est:
+            path = cam.intrinsics_path or os.path.join(out_dir, f"intrinsics_{cfg.mode}_{name}.yaml")
+            K, d = r["K"], r["dist"]
+            with open(path, "w") as f:
+                yaml.safe_dump({"camera": name, "date": stamp, "width": intr.width, "height": intr.height,
+                                "fx": float(K[0, 0]), "fy": float(K[1, 1]), "cx": float(K[0, 2]), "cy": float(K[1, 2]),
+                                "dist": [float(v) for v in d], "n_views": len(per),
+                                "rms_px_median": float(np.median(per))}, f, sort_keys=False)
+            cam.intrinsics = Intrinsics(width=intr.width, height=intr.height, K=K, dist=d)
+            print(f"[calib] wrote {path}")
+        if cam.role == "operator":
+            _report_overlay(cfg, name, cam, r, size, stamp, base.get(name, (None, ""))[0])
     if cfg.reference_tags and cfg.reference.get("measured_path"):
         n_ref = int(c.get("capture", {}).get("reference_frames", 60))
         ref = measure_reference(sources, cams, detector, cfg.reference_tags, n_ref)
-        for s in sources.values():
-            s.close()
         if ref:
-            with open(cfg.reference["measured_path"], "w") as f:
-                yaml.safe_dump({"date": stamp, "mode": cfg.mode, "cameras": ref}, f, sort_keys=False)
+            _save_reference(cfg.reference["measured_path"], ref, stamp, cfg.mode)
             summary = ", ".join(f"{n}: {sorted(v)}" for n, v in ref.items())
             print(f"[calib] wrote {cfg.reference['measured_path']} (reference tags per camera -- {summary})")
-    else:
-        for s in sources.values():
-            s.close()
+        else:
+            print("[calib] no reference tags seen, reference file not written")
+    for s in sources.values():
+        s.close()
