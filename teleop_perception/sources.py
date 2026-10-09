@@ -98,6 +98,8 @@ class ShmSource:
             k32.OpenFileMappingW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
             k32.MapViewOfFile.restype = ctypes.c_void_p
             k32.MapViewOfFile.argtypes = [wt.HANDLE, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t]
+            k32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+            k32.CloseHandle.argtypes = [wt.HANDLE]
             h = k32.OpenFileMappingW(0x0004, False, "Local\\" + self.name.lstrip("/"))
             if not h:
                 return False
@@ -162,6 +164,7 @@ class ShmSource:
         self._view.release()
         if sys.platform == "win32":
             k32, h, ptr = self._handle
+            self._view = None
             self._buf = None
             k32.UnmapViewOfFile(ptr)
             k32.CloseHandle(h)

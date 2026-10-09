@@ -104,8 +104,8 @@ def _settle(arm, T, st):
         detail = f"largest gap between commands {gap * 1000:.0f} ms"
         if errors:
             detail += f", {errors} send errors ({err_msg})"
-        raise ArmNotFollowing(f"arm stopped following the commands ({detail}). The avatar probably switched "
-                              f"POLICY to HOLD -- look for 'no command for' in avatar_stdout.log.")
+        raise ArmNotFollowing(f"arm did not move toward the target ({detail}). Check avatar_stdout.log for "
+                              f"'authority' or 'HOLD' and whether the target is clamped by the safety limits.")
     print(f"[calib] arm did not settle at the target (moved {moved_p * 1000:.0f} mm / {moved_r:.1f} deg "
           f"of {asked_p * 1000:.0f} mm / {asked_r:.1f} deg)")
     return None
@@ -343,7 +343,7 @@ def _collect(cfg, cams, sources, target):
         interrupted = True
     except ArmNotFollowing as e:
         print(f"[calib] {e}")
-        interrupted = True
+        print("[calib] stopping the collection, solving with the poses collected so far")
     finally:
         if engaged_here:
             arm.disengage()

@@ -148,15 +148,17 @@ class ArmClient:
 
     def _send_loop(self):
         """Streams the interpolated command at a fixed rate so the authority watchdog stays quiet."""
-        next_t = time.monotonic()
+        next_t = prev_t = time.monotonic()
         while self.running and self.streaming:
             with self.lock:
                 cmd, goal = self.cmd_T, self.goal_T
-            if goal is not None:
+            t = time.monotonic()
+            step, prev_t = min(t - prev_t, 5.0 * self.dt), t
+            if goal is not None and step > 0.0:
                 dp = goal[:3, 3] - cmd[:3, 3]
                 _, dr_deg = pose_error(cmd, goal)
                 dr = np.radians(dr_deg)
-                n = max(np.linalg.norm(dp) / (self.lin_speed * self.dt), dr / (self.rot_speed * self.dt), 1.0)
+                n = max(np.linalg.norm(dp) / (self.lin_speed * step), dr / (self.rot_speed * step), 1.0)
                 s = 1.0 / n
                 cmd = make_T(_slerp_R(cmd[:3, :3], goal[:3, :3], s), cmd[:3, 3] + s * dp)
                 with self.lock:
