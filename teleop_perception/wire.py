@@ -13,12 +13,12 @@ HOLD = 2
 
 HEADER_FMT = "<IQQBBB"
 ARM_CMD_FMT = HEADER_FMT + "3f4ffB"
-ARM_STATE_FMT = HEADER_FMT + "3f4f7f7fBfBIII"
+ARM_STATE_FMT = HEADER_FMT + "3f4f7f7fBfBIII6f"
 ARM_CMD_SIZE = struct.calcsize(ARM_CMD_FMT)
 ARM_STATE_SIZE = struct.calcsize(ARM_STATE_FMT)
 
 assert ARM_CMD_SIZE == 56, ARM_CMD_SIZE
-assert ARM_STATE_SIZE == 125, ARM_STATE_SIZE
+assert ARM_STATE_SIZE == 149, ARM_STATE_SIZE
 
 
 def pack_arm_command(seq, device_id, position, quaternion, gripper=0.0, state=ENGAGED):
@@ -36,7 +36,7 @@ def unpack_arm_state(data):
     return {
         "seq": f[0], "timestamp_ns": f[1], "sample_time_ns": f[2], "state": f[3], "fault": f[4],
         "device_id": f[5], "position": f[6:9], "quaternion": f[9:13], "joints": f[13:20],
-        "tau_ext": f[20:27], "recovering": bool(f[27]), "gripper_width": f[28], "grasp_state": f[29],
+        "tau_ext": f[20:27], "recovering": bool(f[27]), "gripper_width": f[28], "grasp_state": f[29], "F_ext": f[33:39],
     }
 
 

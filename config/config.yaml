@@ -20,6 +20,7 @@ sim:
   run_dir: build
   task_config: config/tasks/FMB_board_1.yaml
   tagged_task_config: config/tasks/FMB_board_1_tagged.yaml
+  calib_task_config: config/tasks/empty.yaml
   generated_dir: models/mujoco/props/perception
   gripper_model: models/mujoco/robots/franka_fr3/hand.xml
   gripper_device: hand_left
@@ -27,6 +28,7 @@ sim:
   base_pipeline_config: config/pipeline_config_desk_local.yaml
   base_robot_config: config/robot_config_desk_local.yaml
   out_sim_config: config/sim_config_franka_desk_perception.yaml
+  out_calib_sim_config: config/sim_config_franka_desk_perception_calib.yaml
   out_pipeline_config: config/pipeline_config_desk_local_perception.yaml
   out_robot_config: config/robot_config_desk_local_perception.yaml
   authority_stale_ms: 1000

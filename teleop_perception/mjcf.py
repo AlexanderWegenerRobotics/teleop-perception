@@ -274,9 +274,16 @@ def _operator_streams(cfg, pc, rel):
                 else:
                     s.pop("distortion", None)
         und = os.path.join(os.path.dirname(c.extrinsics_path), f"undistort_{cfg.mode}_{c.name}.yaml")
+        intr = c.intrinsics_base or c.intrinsics
+        w, h = int(intr.width), int(intr.height)
         for cam in pc.get("cameras", []):
             if cam.get("shm_name") == shm:
                 cam["undistort"] = rel(und)
+                cam["source_type"] = "mujoco"
+                cam.pop("v4l2_device", None)
+                cam["source_width"], cam["source_height"] = w, h
+                if "stream" in cam:
+                    cam["stream"]["width"], cam["stream"]["height"] = w, h
 
 
 def _load_out(root, base, out):
@@ -287,33 +294,47 @@ def _load_out(root, base, out):
         return yaml.safe_load(f), src != path
 
 
+def _sim_config(cfg, seed, out_key, task, gripper, rel, ref_path, cams):
+    """Writes one perception sim config with the given gripper model, task on first write, reference tags and cameras."""
+    sim = cfg.sim
+    root = sim["root"]
+    sc, new = _load_out(root, seed, sim[out_key])
+    if new:
+        sc["simulation"]["task_config"] = rel(task)
+        if seed == sim["base_sim_config"]:
+            sc.setdefault("rendering", {})["enabled"] = True
+    for d in sc.get("devices", []):
+        if gripper and d.get("name") == sim.get("gripper_device", "hand_left"):
+            d["model_path"] = gripper
+    names = {c["name"] for c in cams}
+    sc["objects"] = [o for o in sc.get("objects", []) if o.get("name") != "perception_reference"]
+    sc["objects"].append({"name": "perception_reference", "type": "static", "model_path": rel(ref_path),
+                          "pose": {"position": [0, 0, 0], "orientation": [1, 0, 0, 0]}})
+    sc["cameras"] = [c for c in sc.get("cameras", []) if c.get("name") not in names] + cams
+    path = os.path.join(root, sim[out_key])
+    _dump(sc, path)
+    return path
+
+
 def sim_configs(cfg, run_dir, tagged_task, ref_path, hand_path):
     """Writes perception variants of the simulator's sim, pipeline and robot configs.
 
-    The first run copies the base configs; later runs only update the entries perception owns (tagged hand,
-    reference tags, perception cameras and streams, operator lens), so hand edits such as rendering or the task
-    survive."""
+    Two sim configs: the deploy one with the plain gripper and the tagged task, and the calibration one with the
+    target on the gripper and a cleared table, seeded from the deploy one. The first run copies the base configs;
+    later runs only update the entries perception owns (gripper model, reference tags, perception cameras and
+    streams, operator lens), so hand edits such as rendering or the task survive."""
     sim = cfg.sim
     root = sim["root"]
     rel = lambda p: os.path.relpath(p, run_dir).replace(os.sep, "/")
     cams, streams = _perception_cameras(cfg)
     names = {c["name"] for c in cams}
     out = []
-    sc, new = _load_out(root, sim["base_sim_config"], sim["out_sim_config"])
-    if new:
-        sc["simulation"]["task_config"] = rel(tagged_task)
-        sc.setdefault("rendering", {})["enabled"] = True
-    if hand_path:
-        for d in sc.get("devices", []):
-            if d.get("name") == sim.get("gripper_device", "hand_left"):
-                d["model_path"] = rel(hand_path)
-    sc["objects"] = [o for o in sc.get("objects", []) if o.get("name") != "perception_reference"]
-    sc["objects"].append({"name": "perception_reference", "type": "static", "model_path": rel(ref_path),
-                          "pose": {"position": [0, 0, 0], "orientation": [1, 0, 0, 0]}})
-    sc["cameras"] = [c for c in sc.get("cameras", []) if c.get("name") not in names] + cams
-    path = os.path.join(root, sim["out_sim_config"])
-    _dump(sc, path)
-    out.append(path)
+    plain = rel(os.path.join(root, sim["gripper_model"])) if sim.get("gripper_model") else None
+    out.append(_sim_config(cfg, sim["base_sim_config"], "out_sim_config", tagged_task, plain, rel, ref_path, cams))
+    if hand_path and sim.get("out_calib_sim_config"):
+        calib_task = os.path.join(root, sim.get("calib_task_config", sim["tagged_task_config"]))
+        out.append(_sim_config(cfg, sim["out_sim_config"], "out_calib_sim_config", calib_task, rel(hand_path), rel,
+                               ref_path, cams))
     pc, _ = _load_out(root, sim["base_pipeline_config"], sim["out_pipeline_config"])
     pc["stream_cameras"] = [s for s in pc.get("stream_cameras", []) if s.get("camera") not in names] + streams
     _operator_streams(cfg, pc, rel)

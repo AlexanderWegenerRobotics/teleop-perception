@@ -37,7 +37,9 @@ python -m teleop_perception run          # live estimation, publish, log (--show
 python -m teleop_perception evaluate logs/<run>
 ```
 
-`generate` writes perception variants of the tabletop sim, pipeline and robot configs next to their base configs (`sim.base_*` in `config.yaml`): tagged task, tagged hand with the cap, reference tags, perception cameras with their shared-memory streams, and `scene_objects` switched on so the avatar sends ground truth. Point the simulator's `config.yaml` at them.
+`generate` writes perception variants of the tabletop sim, pipeline and robot configs next to their base configs (`sim.base_*` in `config.yaml`): tagged task, reference tags, perception cameras with their shared-memory streams, and `scene_objects` switched on so the avatar sends ground truth. Point the simulator's `config.yaml` at them.
+
+There are two sim configs, as on hardware where the target is only mounted for calibration: `sim.out_sim_config` has the plain hand and the tagged task (teleop, tracking), `sim.out_calib_sim_config` has the hand with the target on its cap and a cleared table (`sim.calib_task_config`). Set `avatar_config.sim_config` in the simulator's `config.yaml` to the calibration one for `calibrate`, and back afterwards.
 
 ## Calibration target
 
